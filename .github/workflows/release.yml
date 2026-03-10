@@ -88,6 +88,11 @@ jobs:
           export PATH="/opt/homebrew/opt/e2fsprogs/bin:/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/llvm/bin:$PATH"
           PREBUILT_AGENT=target/agent-binary/smolvm-agent ./scripts/build-dist.sh
 
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 smolvm-*-darwin-arm64.tar.gz > checksums.txt
+
       - name: Get version from tag
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/zotavm-v}" >> "$GITHUB_OUTPUT"
@@ -95,7 +100,9 @@ jobs:
       - name: Upload release artifact
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/smolvm-*-darwin-arm64.tar.gz
+          files: |
+            dist/smolvm-*-darwin-arm64.tar.gz
+            dist/checksums.txt
           tag_name: ${{ github.ref_name }}
           name: Zota ${{ steps.version.outputs.version }}
           draft: false
