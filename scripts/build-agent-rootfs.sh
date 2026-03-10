@@ -31,8 +31,8 @@ OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 ALPINE_VERSION="3.23"
 ALPINE_ARCH="aarch64"  # Change to x86_64 for Intel
 
-# Detect architecture
-case "$(uname -m)" in
+# Detect architecture (allow override via TARGET_ARCH for cross-building)
+case "${TARGET_ARCH:-$(uname -m)}" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
         CRANE_ARCH="arm64"
