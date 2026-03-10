@@ -208,8 +208,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          shasum -a 256 *.tar.gz > checksums.sha256
-          cat checksums.sha256
+          shasum -a 256 *.tar.gz > checksums.txt
+          cat checksums.txt
 
       - name: Get version from tag
         id: version
@@ -223,4 +223,4 @@ jobs:
             --title "Zota ${{ steps.version.outputs.version }}" \
             --generate-notes \
             dist/*.tar.gz \
-            dist/checksums.sha256
+            dist/checksums.txt
