@@ -37,7 +37,7 @@ export INSTALL_ROOTFS
 OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
 # Alpine version
-ALPINE_VERSION="3.19"
+ALPINE_VERSION="3.23"
 
 # Detect or override architecture
 DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
@@ -59,7 +59,7 @@ case "$DETECTED_ARCH" in
 esac
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.3-${ALPINE_ARCH}.tar.gz"
 ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
 # Crane version
@@ -101,9 +101,17 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 # Install additional Alpine packages into the rootfs.
 # Strategies:
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
-#   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
+#   2. Docker (any host with Docker) — full package install + dev tools + Claude Code
+#   3. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+
+# Base packages needed for VM operation
+APK_BASE_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+
+# Dev tool packages for the zota environment
+APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils sudo openssh-client python3 build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano"
+
+APK_ALL_PACKAGES="$APK_BASE_PACKAGES $APK_DEV_PACKAGES"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -142,7 +150,7 @@ install_packages_apk_static() {
         --no-cache \
         --allow-untrusted \
         --arch "$ALPINE_ARCH" \
-        add $APK_PACKAGES
+        add $APK_ALL_PACKAGES
     echo "Packages installed successfully"
 }
 
@@ -174,22 +182,60 @@ repair_executable_modes() {
     done
 }
 
-if [[ "$(uname -s)" == "Linux" ]]; then
-    # On Linux, apk.static is preferred — it handles cross-arch correctly
+install_extras_docker() {
+    # Create non-root user zota with sudo access
+    echo "Creating zota user..."
+    docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        chroot /rootfs adduser -D -s /bin/bash -h /home/zota zota
+        echo "zota ALL=(ALL) NOPASSWD:ALL" >> /rootfs/etc/sudoers
+        chmod 755 /rootfs/home/zota
+    '
+
+    # Install Claude Code inside rootfs via Docker
+    # Requires --privileged for bind mounts so chroot has network access
+    echo "Installing Claude Code..."
+    docker run --rm --privileged -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        # Give chroot network access
+        cp /etc/resolv.conf /rootfs/etc/resolv.conf
+        mount --bind /proc /rootfs/proc
+        mount --bind /sys /rootfs/sys
+        mount --bind /dev /rootfs/dev
+
+        # Install Claude Code as zota user
+        chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
+
+        # Cleanup mounts
+        umount /rootfs/proc /rootfs/sys /rootfs/dev
+    '
+    echo "Claude Code installed successfully"
+}
+
+if [[ "$(uname -s)" == "Linux" ]] && [[ "$CROSS_ARCH" == "1" ]]; then
+    # On Linux with cross-arch, apk.static is the only option that handles it correctly
     install_packages_apk_static
-elif [[ "$CROSS_ARCH" == "1" ]]; then
-    echo "Error: cross-arch rootfs builds (--arch $ALPINE_ARCH on $HOST_ALPINE_ARCH host)"
-    echo "       are only supported on Linux (uses apk.static)."
-    echo "       On macOS, omit --arch or use the same architecture as your host."
-    exit 1
+    if command -v docker &> /dev/null; then
+        install_extras_docker
+    fi
+elif command -v docker &> /dev/null; then
+    echo "  Using Docker..."
+    docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c "
+        apk add --root /rootfs --initdb --no-cache \
+            $APK_ALL_PACKAGES
+    "
+    echo "Packages installed successfully"
+
+    install_extras_docker
+elif [[ "$(uname -s)" == "Linux" ]]; then
+    # Native arch on Linux without Docker — fall back to apk.static
+    install_packages_apk_static
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
     smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
-        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
+        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_ALL_PACKAGES"
     echo "Packages installed successfully"
 else
-    echo "Error: smolvm is required to build the agent rootfs on macOS"
-    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    echo "Error: Docker or smolvm is required to build the agent rootfs"
+    echo "Install Docker or smolvm first"
     exit 1
 fi
 
