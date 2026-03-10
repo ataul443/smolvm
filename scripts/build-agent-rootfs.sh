@@ -129,7 +129,8 @@ if command -v docker &> /dev/null; then
             file \
             perl \
             tar \
-            nano
+            nano \
+            github-cli
     '
     echo "Packages installed successfully"
 
