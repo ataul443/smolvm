@@ -204,17 +204,23 @@ install_extras_docker() {
         # Install Claude Code as zota user
         chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
 
+        # Add ~/.local/bin to PATH so claude command is available
+        echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> /rootfs/home/zota/.bashrc
+
         # Cleanup mounts
         umount /rootfs/proc /rootfs/sys /rootfs/dev
     '
     echo "Claude Code installed successfully"
 }
 
+USED_DOCKER=0
+
 if [[ "$(uname -s)" == "Linux" ]] && [[ "$CROSS_ARCH" == "1" ]]; then
     # On Linux with cross-arch, apk.static is the only option that handles it correctly
     install_packages_apk_static
     if command -v docker &> /dev/null; then
         install_extras_docker
+        USED_DOCKER=1
     fi
 elif command -v docker &> /dev/null; then
     echo "  Using Docker..."
@@ -225,6 +231,7 @@ elif command -v docker &> /dev/null; then
     echo "Packages installed successfully"
 
     install_extras_docker
+    USED_DOCKER=1
 elif [[ "$(uname -s)" == "Linux" ]]; then
     # Native arch on Linux without Docker — fall back to apk.static
     install_packages_apk_static
@@ -240,6 +247,12 @@ else
 fi
 
 repair_executable_modes "$OUTPUT_DIR"
+
+# On Linux, Docker creates files owned by root. Fix ownership so the
+# rest of the script (and CI artifact upload) can access everything.
+if [[ "$USED_DOCKER" == "1" ]] && [[ "$(uname -s)" == "Linux" ]]; then
+    sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR"
+fi
 
 # Create necessary directories
 mkdir -p "$OUTPUT_DIR/storage"
