@@ -230,7 +230,14 @@ echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
-if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
+# Allow using a pre-built agent binary via PREBUILT_AGENT env var
+# (used in CI where agent is built on a separate Linux runner)
+if [[ -n "${PREBUILT_AGENT:-}" ]] && [[ -f "${PREBUILT_AGENT}" ]]; then
+    echo "Using pre-built agent binary: $PREBUILT_AGENT"
+    mkdir -p "$PROJECT_ROOT/target/release-small"
+    cp "$PREBUILT_AGENT" "$PROJECT_ROOT/target/release-small/smolvm-agent"
+    chmod +x "$PROJECT_ROOT/target/release-small/smolvm-agent"
+elif [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
     echo "Skipping agent build (--skip-agent-build)"
     if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
         echo "Error: --skip-agent-build requires a pre-built agent at target/release-small/smolvm-agent"
@@ -247,21 +254,32 @@ else
                 mkdir -p ./target/release-small
                 cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
                    "./target/release-small/smolvm-agent"
+            else
+                # Fall back to Docker build
+                if command -v docker &> /dev/null; then
+                    docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+                        "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+                fi
             fi
         fi
-    fi
-
-    # If native build didn't produce the binary, use smolvm
-    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
-        if command -v smolvm &> /dev/null; then
+    else
+        # Non-Linux: try Docker, then smolvm
+        if command -v docker &> /dev/null; then
+            docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+                "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+        elif command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
             smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile release-small -p smolvm-agent"
-        else
-            echo "Error: Cannot build smolvm-agent."
-            echo "  Install smolvm or the musl target (rustup target add x86_64-unknown-linux-musl)"
-            exit 1
         fi
+    fi
+
+    # Final check
+    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
+        echo "Error: Cannot build smolvm-agent."
+        echo "  Set PREBUILT_AGENT=/path/to/smolvm-agent, install Docker,"
+        echo "  or install the musl target (rustup target add x86_64-unknown-linux-musl)"
+        exit 1
     fi
 fi
 
