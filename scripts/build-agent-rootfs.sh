@@ -39,8 +39,8 @@ OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 # Alpine version
 ALPINE_VERSION="3.23"
 
-# Detect or override architecture
-DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
+# Detect or override architecture (--arch flag > TARGET_ARCH env > host arch)
+DETECTED_ARCH="${OVERRIDE_ARCH:-${TARGET_ARCH:-$(uname -m)}}"
 case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
