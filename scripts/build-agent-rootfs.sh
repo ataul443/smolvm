@@ -154,10 +154,19 @@ if command -v docker &> /dev/null; then
         # Install Claude Code as zota user
         chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
 
+        # Add ~/.local/bin to PATH so claude command is available
+        echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> /rootfs/home/zota/.bashrc
+
         # Cleanup mounts
         umount /rootfs/proc /rootfs/sys /rootfs/dev
     '
     echo "Claude Code installed successfully"
+
+    # On Linux, Docker creates files owned by root. Fix ownership so the
+    # rest of the script (and CI artifact upload) can access everything.
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR"
+    fi
 else
     echo "Warning: Docker not found, skipping package installation"
     echo "You may need to install packages manually"
