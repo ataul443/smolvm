@@ -158,6 +158,9 @@ if command -v docker &> /dev/null; then
         # Add ~/.local/bin to PATH so claude command is available
         echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> /rootfs/home/zota/.bashrc
 
+        # Symlink claude into /usr/local/bin so it works for all users (including root via microvm exec)
+        ln -sf /home/zota/.local/bin/claude /rootfs/usr/local/bin/claude
+
         # Cleanup mounts
         umount /rootfs/proc /rootfs/sys /rootfs/dev
     '
