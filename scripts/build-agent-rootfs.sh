@@ -109,7 +109,7 @@ echo "Installing additional packages..."
 APK_BASE_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
 
 # Dev tool packages for the zota environment
-APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils sudo openssh-client python3 build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano"
+APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils sudo openssh-client python3 build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano github-cli"
 
 APK_ALL_PACKAGES="$APK_BASE_PACKAGES $APK_DEV_PACKAGES"
 
