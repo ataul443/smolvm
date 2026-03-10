@@ -98,6 +98,9 @@ if command -v docker &> /dev/null; then
             e2fsprogs \
             e2fsprogs-extra \
             crun \
+            podman \
+            fuse-overlayfs \
+            slirp4netns \
             util-linux \
             libcap \
             git \
@@ -114,6 +117,7 @@ if command -v docker &> /dev/null; then
             sudo \
             openssh-client \
             python3 \
+            py3-pip \
             build-base \
             openssl \
             wget \
@@ -152,6 +156,9 @@ if command -v docker &> /dev/null; then
         mount --bind /sys /rootfs/sys
         mount --bind /dev /rootfs/dev
 
+        # Install podman-compose
+        chroot /rootfs pip3 install --break-system-packages podman-compose
+
         # Install Claude Code as zota user
         chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
 
@@ -161,15 +168,28 @@ if command -v docker &> /dev/null; then
         # Symlink claude into /usr/local/bin so it works for all users (including root via microvm exec)
         ln -sf /home/zota/.local/bin/claude /rootfs/usr/local/bin/claude
 
+        # Docker aliases (podman is a drop-in replacement)
+        ln -sf /usr/bin/podman /rootfs/usr/local/bin/docker
+        ln -sf /usr/bin/podman-compose /rootfs/usr/local/bin/docker-compose
+
         # Cleanup mounts
         umount /rootfs/proc /rootfs/sys /rootfs/dev
     '
     echo "Claude Code installed successfully"
 
-    # On Linux, Docker creates files owned by root. Fix ownership so the
-    # rest of the script (and CI artifact upload) can access everything.
+    # On Linux CI, chown back to runner user so artifact upload works.
     if [[ "$(uname -s)" == "Linux" ]]; then
         sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR"
+    fi
+
+    # On macOS, strip extended attributes left by Docker Desktop.
+    # Docker Desktop's gRPC-FUSE driver adds com.apple.provenance and
+    # com.docker.grpcfuse.ownership xattrs to every file. When libkrun's
+    # virtiofs serves these to the Linux VM, overlayfs copy-up tries to
+    # replicate them to the ext4 upper layer and fails with I/O errors.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "Stripping macOS extended attributes from rootfs..."
+        xattr -cr "$OUTPUT_DIR"
     fi
 else
     echo "Warning: Docker not found, skipping package installation"
