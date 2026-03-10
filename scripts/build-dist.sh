@@ -218,36 +218,43 @@ if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkru
     exit 1
 fi
 
-# Check for Docker (required for cross-compiling agent)
-if ! command -v docker &> /dev/null; then
-    echo "Error: Docker is required to cross-compile the agent for Linux"
-    exit 1
-fi
-
 # Build release binaries
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
-echo "Building smolvm-agent for Linux (optimized for size)..."
-if [[ "$(uname -s)" == "Linux" ]]; then
-    # On Linux, build natively with musl for static linking
-    if command -v cargo &> /dev/null; then
-        # Check if musl target is available
-        if rustup target list --installed 2>/dev/null | grep -q musl; then
-            cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+# Allow using a pre-built agent binary via PREBUILT_AGENT env var
+# (used in CI where agent is built on a separate Linux runner)
+if [[ -n "${PREBUILT_AGENT:-}" ]] && [[ -f "${PREBUILT_AGENT}" ]]; then
+    echo "Using pre-built agent binary: $PREBUILT_AGENT"
+    mkdir -p "$PROJECT_ROOT/target/release-small"
+    cp "$PREBUILT_AGENT" "$PROJECT_ROOT/target/release-small/smolvm-agent"
+    chmod +x "$PROJECT_ROOT/target/release-small/smolvm-agent"
+elif command -v docker &> /dev/null; then
+    echo "Building smolvm-agent for Linux (optimized for size)..."
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # On Linux, build natively with musl for static linking
+        if command -v cargo &> /dev/null; then
+            # Check if musl target is available
+            if rustup target list --installed 2>/dev/null | grep -q musl; then
+                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+            else
+                # Fall back to Docker build
+                docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+                    "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+            fi
         else
-            # Fall back to Docker build
             docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
                 "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
         fi
     else
-        docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+        docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
             "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
     fi
 else
-    docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-        "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+    echo "Error: No pre-built agent (PREBUILT_AGENT) and Docker not available."
+    echo "Either set PREBUILT_AGENT=/path/to/smolvm-agent or install Docker."
+    exit 1
 fi
 
 # Sign binary (macOS only)
