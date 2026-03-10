@@ -28,7 +28,7 @@ export INSTALL_ROOTFS
 OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
 # Alpine version
-ALPINE_VERSION="3.19"
+ALPINE_VERSION="3.23"
 ALPINE_ARCH="aarch64"  # Change to x86_64 for Intel
 
 # Detect architecture
@@ -50,7 +50,7 @@ case "$(uname -m)" in
 esac
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.3-${ALPINE_ARCH}.tar.gz"
 ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
 # Crane version
@@ -99,12 +99,68 @@ if command -v docker &> /dev/null; then
             e2fsprogs-extra \
             crun \
             util-linux \
-            libcap
+            libcap \
+            git \
+            curl \
+            bash \
+            nodejs \
+            npm \
+            libgcc \
+            libstdc++ \
+            ripgrep \
+            gcompat \
+            libc6-compat \
+            binutils \
+            sudo \
+            openssh-client \
+            python3 \
+            build-base \
+            openssl \
+            wget \
+            unzip \
+            zip \
+            findutils \
+            coreutils \
+            diffutils \
+            patch \
+            less \
+            procps \
+            tree \
+            file \
+            perl \
+            tar \
+            nano
     '
     echo "Packages installed successfully"
+
+    # Create non-root user zota with sudo access
+    echo "Creating zota user..."
+    docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        chroot /rootfs adduser -D -s /bin/bash -h /home/zota zota
+        echo "zota ALL=(ALL) NOPASSWD:ALL" >> /rootfs/etc/sudoers
+        chmod 755 /rootfs/home/zota
+    '
+
+    # Install Claude Code inside rootfs via Docker
+    # Requires --privileged for bind mounts so chroot has network access
+    echo "Installing Claude Code..."
+    docker run --rm --privileged -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        # Give chroot network access
+        cp /etc/resolv.conf /rootfs/etc/resolv.conf
+        mount --bind /proc /rootfs/proc
+        mount --bind /sys /rootfs/sys
+        mount --bind /dev /rootfs/dev
+
+        # Install Claude Code as zota user
+        chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
+
+        # Cleanup mounts
+        umount /rootfs/proc /rootfs/sys /rootfs/dev
+    '
+    echo "Claude Code installed successfully"
 else
     echo "Warning: Docker not found, skipping package installation"
-    echo "You may need to install packages manually: jq e2fsprogs crun util-linux"
+    echo "You may need to install packages manually"
 fi
 
 # Create necessary directories
