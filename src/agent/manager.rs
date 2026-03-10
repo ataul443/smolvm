@@ -182,10 +182,8 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("smolvm")
+    crate::paths::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm"))
         .join("vms")
 }
 
@@ -351,10 +349,7 @@ impl AgentManager {
         let smolvm_runtime = if let Some(ref vm_name) = name {
             vm_data_dir(vm_name)
         } else {
-            dirs::runtime_dir()
-                .or_else(dirs::cache_dir)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("smolvm")
+            crate::paths::runtime_dir()
         };
         std::fs::create_dir_all(&smolvm_runtime)?;
 
@@ -455,15 +450,15 @@ impl AgentManager {
     /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
     /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        // SMOLVM_AGENT_ROOTFS is a more specific override that always takes priority.
         if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
             return Ok(PathBuf::from(path));
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = crate::paths::data_dir()
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
-        Ok(data_dir.join("smolvm").join("agent-rootfs"))
+        Ok(data_dir.join("agent-rootfs"))
     }
 
     /// Get the current state of the agent.

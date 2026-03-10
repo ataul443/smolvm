@@ -193,8 +193,16 @@ const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
 /// Get the cache directory for a given checksum.
 ///
-/// Returns `~/.cache/smolvm-pack/<checksum>/` (hex-formatted).
+/// When `SMOLVM_HOME` is set: `$SMOLVM_HOME/cache/pack/<checksum>/` (hex-formatted).
+/// Otherwise: `~/.cache/smolvm-pack/<checksum>/` (hex-formatted).
 pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
+    if let Ok(home) = std::env::var("SMOLVM_HOME") {
+        return Ok(PathBuf::from(home)
+            .join("cache")
+            .join("pack")
+            .join(format!("{:08x}", checksum)));
+    }
+
     let base = dirs::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
 

@@ -74,6 +74,7 @@ pub mod dns_filter_listener;
 pub mod embedded;
 pub mod log_rotation;
 pub mod network;
+pub mod paths;
 pub mod platform;
 pub mod process;
 pub mod registry;
