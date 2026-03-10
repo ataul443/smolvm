@@ -159,13 +159,13 @@ struct AgentInner {
 
 /// Get the data directory for a named VM.
 ///
-/// Returns `~/.cache/smolvm/vms/{name}/` (macOS) or equivalent on other platforms.
+/// Returns `$SMOLVM_HOME/cache/vms/{name}/` when `SMOLVM_HOME` is set,
+/// or `~/.cache/smolvm/vms/{name}/` (macOS) / `~/.cache/smolvm/vms/{name}/`
+/// (Linux) otherwise.
 /// This is the canonical location for a VM's storage disk, overlay disk, and socket.
 pub fn vm_data_dir(name: &str) -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("smolvm")
+    crate::paths::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm"))
         .join("vms")
         .join(name)
 }
@@ -240,16 +240,15 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        // Create runtime directory for sockets
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        // Create runtime directory for sockets.
+        // crate::paths::runtime_dir() already appends "smolvm" to the base.
+        let smolvm_runtime_base = crate::paths::runtime_dir();
 
         // Named VMs get their own subdirectory
         let smolvm_runtime = if let Some(ref vm_name) = name {
-            runtime_dir.join("smolvm").join("vms").join(vm_name)
+            smolvm_runtime_base.join("vms").join(vm_name)
         } else {
-            runtime_dir.join("smolvm")
+            smolvm_runtime_base
         };
         std::fs::create_dir_all(&smolvm_runtime)?;
 
@@ -346,15 +345,15 @@ impl AgentManager {
     /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
     /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        // SMOLVM_AGENT_ROOTFS is a more specific override that always takes priority.
         if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
             return Ok(PathBuf::from(path));
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = crate::paths::data_dir()
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
-        Ok(data_dir.join("smolvm").join("agent-rootfs"))
+        Ok(data_dir.join("agent-rootfs"))
     }
 
     /// Get the current state of the agent.

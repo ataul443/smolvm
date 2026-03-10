@@ -216,11 +216,7 @@ impl Supervisor {
 
     /// Get the console log path for a sandbox.
     fn get_sandbox_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        let log_path = runtime_dir
-            .join("smolvm")
+        let log_path = crate::paths::runtime_dir()
             .join("vms")
             .join(name)
             .join("agent-console.log");

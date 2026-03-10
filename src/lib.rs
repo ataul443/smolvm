@@ -70,6 +70,7 @@ pub mod error;
 pub mod log_rotation;
 pub mod mount;
 pub mod network;
+pub mod paths;
 pub mod platform;
 pub mod process;
 pub mod registry;

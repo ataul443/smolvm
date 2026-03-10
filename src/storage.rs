@@ -83,14 +83,26 @@ fn create_sparse_disk(path: &Path, size_bytes: u64, label: &str) -> Result<()> {
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
-/// 1. `~/.smolvm/{filename}` (installed location)
-/// 2. Next to the current executable (development)
+/// 1. `$SMOLVM_HOME/{filename}` when `SMOLVM_HOME` is set, or
+///    `~/Library/Application Support/smolvm/{filename}` / `~/.local/share/smolvm/{filename}`
+/// 2. `~/.smolvm/{filename}` (legacy installed location)
+/// 3. Next to the current executable (development)
 fn find_disk_template(template_filename: &str) -> Option<PathBuf> {
+    // Primary: smolvm data directory (respects SMOLVM_HOME)
+    if let Some(data_dir) = crate::paths::data_dir() {
+        let primary_path = data_dir.join(template_filename);
+        if primary_path.exists() {
+            tracing::debug!(path = %primary_path.display(), "found disk template");
+            return Some(primary_path);
+        }
+    }
+
+    // Legacy: ~/.smolvm/ (kept for backward compatibility when SMOLVM_HOME is not set)
     if let Some(home) = dirs::home_dir() {
-        let installed_path = home.join(".smolvm").join(template_filename);
-        if installed_path.exists() {
-            tracing::debug!(path = %installed_path.display(), "found disk template");
-            return Some(installed_path);
+        let legacy_path = home.join(".smolvm").join(template_filename);
+        if legacy_path.exists() {
+            tracing::debug!(path = %legacy_path.display(), "found disk template (legacy ~/.smolvm)");
+            return Some(legacy_path);
         }
     }
 
@@ -382,15 +394,14 @@ pub struct StorageDisk {
 impl StorageDisk {
     /// Get the default path for the storage disk.
     ///
+    /// When `SMOLVM_HOME` is set: `$SMOLVM_HOME/storage.raw`
     /// On macOS: `~/Library/Application Support/smolvm/storage.raw`
     /// On Linux: `~/.local/share/smolvm/storage.raw`
     pub fn default_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = crate::paths::data_dir()
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
-        let smolvm_dir = data_dir.join("smolvm");
-        Ok(smolvm_dir.join(STORAGE_DISK_FILENAME))
+        Ok(data_dir.join(STORAGE_DISK_FILENAME))
     }
 
     /// Open or create the storage disk at the default location.
