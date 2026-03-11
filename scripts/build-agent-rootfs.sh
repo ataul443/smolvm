@@ -109,7 +109,7 @@ echo "Installing additional packages..."
 APK_BASE_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
 
 # Dev tool packages for the zota environment
-APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils sudo openssh-client python3 py3-pip build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano github-cli"
+APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils openssh-client go python3 py3-pip build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano github-cli"
 
 APK_ALL_PACKAGES="$APK_BASE_PACKAGES $APK_DEV_PACKAGES"
 
@@ -183,13 +183,25 @@ repair_executable_modes() {
 }
 
 install_extras_docker() {
-    # Create non-root user zota with sudo access
+    # Create non-root user zota (no sudo, but owns global package dirs)
     echo "Creating zota user..."
     docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
         chroot /rootfs adduser -D -s /bin/bash -h /home/zota zota
-        echo "zota ALL=(ALL) NOPASSWD:ALL" >> /rootfs/etc/sudoers
         chmod 755 /rootfs/home/zota
+
+        # Let zota own npm/pnpm dirs so "npm install -g" works without sudo
+        mkdir -p /rootfs/home/zota/.npm-global
+        mkdir -p /rootfs/home/zota/.npm
+        mkdir -p /rootfs/home/zota/.local/share/pnpm
+        mkdir -p /rootfs/home/zota/.local/bin
+        chown -R 1000:1000 /rootfs/home/zota
     '
+
+    # Configure npm global prefix to user-owned directory
+    cat > "$OUTPUT_DIR/home/zota/.npmrc" <<'NPMRC'
+prefix=/home/zota/.npm-global
+cache=/home/zota/.npm
+NPMRC
 
     # Install Claude Code inside rootfs via Docker
     # Requires --privileged for bind mounts so chroot has network access
@@ -204,16 +216,28 @@ install_extras_docker() {
         # Install Claude Code as zota user
         chroot /rootfs su - zota -c "curl -fsSL https://claude.ai/install.sh | bash"
 
-        # Add ~/.local/bin to PATH so claude command is available
-        echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> /rootfs/home/zota/.bashrc
-
-        # Symlink claude into /usr/local/bin so it works for all users (including root via microvm exec)
-        ln -sf /home/zota/.local/bin/claude /rootfs/usr/local/bin/claude
-
         # Cleanup mounts
         umount /rootfs/proc /rootfs/sys /rootfs/dev
     '
     echo "Claude Code installed successfully"
+
+    # Set up PATH in .bashrc for npm-global, pnpm, and local bins
+    cat > "$OUTPUT_DIR/home/zota/.bashrc" <<'BASHRC'
+export PATH="$HOME/.npm-global/bin:$HOME/.local/share/pnpm:$HOME/.local/bin:$HOME/go/bin:$PATH"
+export PNPM_HOME="$HOME/.local/share/pnpm"
+export GOPATH="$HOME/go"
+export PIP_USER=1
+export PYTHONUSERBASE="$HOME/.local"
+BASHRC
+
+    # Symlink claude into /usr/local/bin so it works for all users (including root via microvm exec)
+    ln -sf /home/zota/.local/bin/claude "$OUTPUT_DIR/usr/local/bin/claude"
+
+    # Fix ownership — Docker Desktop on macOS remaps UIDs (501 instead of 1000)
+    echo "Fixing file ownership in rootfs..."
+    docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        chown -R 1000:1000 /rootfs/home/zota
+    '
 }
 
 USED_DOCKER=0
