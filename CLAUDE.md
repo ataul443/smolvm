@@ -10,7 +10,7 @@ This is the **Zota fork** of smolVM (`ataul443/smolvm`, forked from `smol-machin
 
 - **Alpine 3.23** base rootfs (upgraded from 3.19, required for Claude Code musl binary)
 - **Claude Code** pre-installed in the agent rootfs via `curl -fsSL https://claude.ai/install.sh | bash`
-- **`zota` user** — non-root user with passwordless sudo, home at `/home/zota`
+- **`zota` user** — non-root user (no sudo), owns global npm/pnpm dirs so `npm install -g` works without root
 - **Dev-essential packages** added to rootfs: git, curl, bash, nodejs, npm, python3, build-base, openssh-client, ripgrep, coreutils, findutils, diffutils, nano, wget, and more
 - **Release workflow** (`.github/workflows/release.yml`) triggered on `zotavm-v*` tags
 - `main` branch is kept in sync with upstream for merging; all Zota changes live on `zotavm/main`
@@ -115,7 +115,7 @@ The VM boots an Alpine 3.23 minirootfs with:
 - **PID 1**: `/sbin/init` symlinked to `/usr/local/bin/smolvm-agent`
 - **Crane** v0.19.0 for OCI image operations
 - **Claude Code** installed under `/home/zota/.local/bin/claude`
-- **User**: `zota` (non-root, passwordless sudo)
+- **User**: `zota` (non-root, no sudo, owns global package dirs)
 - **Packages**: jq, e2fsprogs, crun, util-linux, libcap, git, curl, bash, nodejs, npm, python3, build-base, openssh-client, ripgrep, coreutils, findutils, diffutils, and more
 - Build uses `--privileged` Docker to bind-mount `/proc`, `/sys`, `/dev` into the rootfs chroot for network access during npm/curl installs
 
