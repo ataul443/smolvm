@@ -109,7 +109,7 @@ echo "Installing additional packages..."
 APK_BASE_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
 
 # Dev tool packages for the zota environment
-APK_DEV_PACKAGES="git curl bash nodejs npm libgcc libstdc++ ripgrep gcompat libc6-compat binutils openssh-client go python3 py3-pip build-base openssl wget unzip zip findutils coreutils diffutils patch less procps tree file perl tar nano github-cli"
+APK_DEV_PACKAGES="git curl bash libgcc libstdc++ ripgrep gcompat libc6-compat binutils openssh-client python3 py3-pip build-base openssl wget unzip zip findutils coreutils diffutils tar github-cli"
 
 APK_ALL_PACKAGES="$APK_BASE_PACKAGES $APK_DEV_PACKAGES"
 
@@ -183,25 +183,17 @@ repair_executable_modes() {
 }
 
 install_extras_docker() {
-    # Create non-root user zota (no sudo, but owns global package dirs)
+    # Create non-root user zota with passwordless sudo
     echo "Creating zota user..."
     docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
+        apk add --root /rootfs --no-cache sudo
         chroot /rootfs adduser -D -s /bin/bash -h /home/zota zota
+        echo "zota ALL=(ALL) NOPASSWD: ALL" > /rootfs/etc/sudoers.d/zota
+        chmod 440 /rootfs/etc/sudoers.d/zota
         chmod 755 /rootfs/home/zota
-
-        # Let zota own npm/pnpm dirs so "npm install -g" works without sudo
-        mkdir -p /rootfs/home/zota/.npm-global
-        mkdir -p /rootfs/home/zota/.npm
-        mkdir -p /rootfs/home/zota/.local/share/pnpm
         mkdir -p /rootfs/home/zota/.local/bin
         chown -R 1000:1000 /rootfs/home/zota
     '
-
-    # Configure npm global prefix to user-owned directory
-    cat > "$OUTPUT_DIR/home/zota/.npmrc" <<'NPMRC'
-prefix=/home/zota/.npm-global
-cache=/home/zota/.npm
-NPMRC
 
     # Install Claude Code inside rootfs via Docker
     # Requires --privileged for bind mounts so chroot has network access
@@ -221,13 +213,9 @@ NPMRC
     '
     echo "Claude Code installed successfully"
 
-    # Set up PATH in .bashrc for npm-global, pnpm, and local bins
+    # Set up PATH in .bashrc
     cat > "$OUTPUT_DIR/home/zota/.bashrc" <<'BASHRC'
-export PATH="$HOME/.npm-global/bin:$HOME/.local/share/pnpm:$HOME/.local/bin:$HOME/go/bin:$PATH"
-export PNPM_HOME="$HOME/.local/share/pnpm"
-export GOPATH="$HOME/go"
-export PIP_USER=1
-export PYTHONUSERBASE="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
 BASHRC
 
     # Symlink claude into /usr/local/bin so it works for all users (including root via microvm exec)
