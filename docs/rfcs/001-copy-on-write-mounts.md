@@ -1,4 +1,4 @@
-# RFC 001: Copy-on-Write Volume Mounts
+# RFC 001: MicroVM Copy-on-Write Cloning
 
 **Status:** Draft
 **Author:** smolvm contributors
@@ -6,23 +6,24 @@
 
 ## Summary
 
-Add a new `cow` (copy-on-write) mount mode to smolVM that allows containers to see the full contents of a host-mounted directory but keeps all modifications (writes, deletes, renames) local to the container. The host directory is never modified.
+Add the ability to **clone a microVM** using copy-on-write semantics. A parent microVM serves as an immutable base — its overlay disk, storage disk, and host-mounted directories become read-only lower layers. A child microVM is created on top with thin COW disks that only store deltas. The host filesystem is never modified. This enables instant VM forking, safe experimentation, and branching workflows.
 
 ## Motivation
 
-Today smolVM supports two volume mount modes:
+Today, every smolVM microVM is independent. If you want two VMs with similar environments (same packages installed, same tools configured, same project mounted), you must set each up from scratch. There is no way to:
 
-- **`rw`** (writable) — writes propagate directly to the host via virtiofs
-- **`ro`** (read-only) — writes are rejected entirely
+1. **Fork a running VM** — take a snapshot of a configured environment and spin up a copy
+2. **Branch from a base** — create multiple divergent environments from a common parent (e.g., test different dependency versions)
+3. **Mount host files safely** — mount a host directory into the VM so the VM can read and "modify" files without changing the host
 
-Neither satisfies a common use case: **mount a host project directory so the container can read the source code, build artifacts, install dependencies, and modify files — without altering anything on the host.** This is essential for:
+These are essential for:
 
-- **Sandboxed CI/CD:** Run builds against a host checkout without polluting the working tree
-- **Safe experimentation:** Let an AI agent or developer try changes inside a container, inspect results, and discard them
-- **Reproducible environments:** Multiple containers can mount the same host directory and each see their own isolated view
-- **Security:** Prevent a compromised container from modifying host files even when it needs read access
+- **AI agent workflows:** An agent configures a VM (installs tools, clones repos, sets up environment), then forks multiple copies to explore different approaches in parallel — each isolated, each disposable
+- **Development branching:** Set up a base dev environment once, then `smolvm microvm copy` into throwaway VMs for each feature branch or experiment
+- **Reproducible debugging:** Copy a production-like VM, make changes to debug an issue, discard the copy when done
+- **Safe host mounts:** Mount `/Users/me/code` into a VM where the agent can freely modify files, build, test — without any writes reaching the host. If the result is good, explicitly sync back; if not, just delete the child VM
 
-Docker and Podman don't natively offer per-mount COW either (they rely on tmpfs overlays or external tools). smolVM can provide this as a first-class feature because it controls both the host launcher and the in-guest agent.
+The key insight is that **COW belongs at the VM level, not the container level.** A microVM is the unit of environment state — its overlay disk captures installed packages, its storage disk holds cached images, and its mounts provide access to host code. Cloning the VM clones all of this in O(1) via COW disk chains.
 
 ## Design
 
@@ -30,418 +31,559 @@ Docker and Podman don't natively offer per-mount COW either (they rely on tmpfs 
 
 #### CLI
 
-Extend the existing `-v` / `--volume` mount syntax with a `cow` mode:
+```bash
+# Create and configure a base microVM
+smolvm microvm create base-dev --cpus 2 --mem 2048 --net \
+    -v /Users/me/project:/workspace
+smolvm microvm start base-dev
+smolvm microvm exec base-dev -- apk add git nodejs npm python3
+smolvm microvm exec base-dev -- npm install -g typescript
+smolvm microvm stop base-dev
 
-```
-# Existing modes (unchanged)
-smolvm sandbox run -v /host/path:/container/path        # rw (default)
-smolvm sandbox run -v /host/path:/container/path:ro      # read-only
-smolvm sandbox run -v /host/path:/container/path:rw      # explicit rw
+# Clone it — instant, O(1), COW
+smolvm microvm copy base-dev feature-a
+smolvm microvm copy base-dev feature-b
+smolvm microvm copy base-dev experiment
 
-# New mode
-smolvm sandbox run -v /host/path:/container/path:cow     # copy-on-write
+# Each child has its own isolated world
+smolvm microvm start feature-a
+smolvm microvm exec feature-a -- sh -c 'cd /workspace && git checkout feature-a && npm test'
+# /Users/me/project on the host is UNCHANGED
+
+# Children can be cloned too (chained COW)
+smolvm microvm copy feature-a feature-a-debug
+
+# Inspect what the child changed relative to parent
+smolvm microvm diff feature-a
+
+# Sync changes back to host (explicit, opt-in)
+smolvm microvm sync feature-a --mount /workspace
+
+# Discard when done — only deletes thin delta disks
+smolvm microvm delete feature-a
 ```
 
 #### HTTP API
 
-Extend `MountSpec` with an optional `mode` field:
-
-```json
+```
+POST /api/v1/microvms/{name}/copy
 {
-  "source": "/Users/me/code",
-  "target": "/workspace",
-  "readonly": false,
-  "mode": "cow"
+  "name": "feature-a",
+  "resources": { "cpus": 4, "memoryMb": 4096 }  // optional overrides
 }
 ```
 
-For backward compatibility, when `mode` is absent the current behavior applies: `readonly: true` → `ro`, `readonly: false` → `rw`.
-
-#### SDK (Node.js)
-
-```javascript
-const sandbox = await smolvm.sandbox.create({
-  mounts: [{
-    source: "/Users/me/code",
-    target: "/workspace",
-    mode: "cow"
-  }]
-});
+Response:
+```json
+{
+  "name": "feature-a",
+  "parent": "base-dev",
+  "state": "created",
+  "cow_disks": {
+    "overlay": "~/.local/share/smolvm/vms/feature-a/overlay.qcow2",
+    "storage": "~/.local/share/smolvm/vms/feature-a/storage.qcow2"
+  }
+}
 ```
 
 ### Architecture
 
-The COW mount is implemented as an **overlayfs** mount at the **container level** via the OCI runtime spec, not as an agent-level mount hack. This is the cleanest approach because:
+#### How a MicroVM's State is Stored Today
 
-1. **Per-container isolation** — each container gets its own upper layer
-2. **Automatic cleanup** — upper layer is removed when the container is deleted
-3. **Leverages existing infrastructure** — crun already processes OCI mount entries as root before dropping privileges
-4. **Consistent** — uses the same overlayfs mechanism that already provides COW for image layers
+Each microVM has two block devices attached via virtio-blk:
 
-#### Data Flow
+| Device | Purpose | Default Size | Format |
+|--------|---------|-------------|--------|
+| `/dev/vda` | **Storage disk** — OCI layers, container overlays, manifests | 20 GB sparse raw | ext4 |
+| `/dev/vdb` | **Overlay disk** — persistent rootfs changes (packages, configs) | 10 GB sparse raw | ext4 |
+
+On boot, the agent (`main.rs:342`) mounts `/dev/vdb` as the upper layer of an overlayfs over the initramfs (virtiofs rootfs), then `pivot_root`s into it. All system-level changes (e.g., `apk add git`) persist to `/dev/vdb`.
+
+Host directories are mounted via virtiofs and currently bind-mounted directly — writes propagate to the host.
+
+#### How VM Cloning Works
+
+When you run `smolvm microvm copy parent child`:
 
 ```
-Host                          Guest VM (Alpine)                Container (crun)
-────                          ────────────────                 ─────────────────
+Parent VM (stopped)                    Child VM (new)
+─────────────────                      ──────────────
 
-/Users/me/code ──virtiofs──▶ /mnt/virtiofs/smolvm0
-                              (staging, read-only lower)
-                                                               overlayfs mount:
-                                                                 lowerdir = /mnt/virtiofs/smolvm0
-                                                                 upperdir = /mnt/cow/<container_id>/smolvm0/upper
-                                                                 workdir  = /mnt/cow/<container_id>/smolvm0/work
-                                                                 merged   = /workspace (inside container)
+overlay.raw (ext4, 10 GB)    ──────▶  overlay.qcow2 (thin, QCOW2)
+  Contains: installed packages,           backing_file = parent/overlay.raw
+  configs, rootfs modifications           Contains: only child's new changes
+
+storage.raw (ext4, 20 GB)    ──────▶  storage.qcow2 (thin, QCOW2)
+  Contains: OCI layers,                  backing_file = parent/storage.raw
+  container state, manifests              Contains: only child's new changes
+
+virtiofs mounts (host dirs)   ──────▶  Same virtiofs mounts, BUT
+  /Users/me/project                      agent overlays them at boot:
+  Currently: direct rw bind              lowerdir = virtiofs staging
+                                         upperdir = /mnt/storage/cow-mounts/smolvm0/upper
+                                         → writes stay in child's storage disk
 ```
 
-#### OCI Spec Generation
+##### Disk Layout
 
-Currently, `add_bind_mount()` in `oci.rs` generates:
-
-```json
-{
-  "destination": "/workspace",
-  "type": "bind",
-  "source": "/mnt/virtiofs/smolvm0",
-  "options": ["bind", "rprivate"]
-}
+```
+~/.local/share/smolvm/vms/
+├── base-dev/                          # Parent VM
+│   ├── overlay.raw                    # 10 GB sparse ext4 (packages, configs)
+│   ├── overlay.raw.formatted
+│   ├── storage.raw                    # 20 GB sparse ext4 (OCI layers)
+│   └── storage.raw.formatted
+│
+├── feature-a/                         # Child VM (COW clone)
+│   ├── overlay.qcow2                  # Thin QCOW2, backs to ../base-dev/overlay.raw
+│   ├── storage.qcow2                  # Thin QCOW2, backs to ../base-dev/storage.raw
+│   └── cow-mounts.json               # Mount overlay metadata
+│
+└── feature-a-debug/                   # Grandchild (chained COW)
+    ├── overlay.qcow2                  # Backs to ../feature-a/overlay.qcow2
+    └── storage.qcow2                  # Backs to ../feature-a/storage.qcow2
 ```
 
-For COW mounts, a new `add_overlay_mount()` method generates:
+##### QCOW2 Backing Chains
 
-```json
-{
-  "destination": "/workspace",
-  "type": "overlay",
-  "source": "overlay",
-  "options": [
-    "lowerdir=/mnt/virtiofs/smolvm0",
-    "upperdir=/mnt/cow/<container_id>/smolvm0/upper",
-    "workdir=/mnt/cow/<container_id>/smolvm0/work"
-  ]
-}
+libkrun already supports QCOW2 via `krun_add_disk2(ctx, block_id, path, 1 /* Qcow2 */, false)` and `DiskFormat::Qcow2` exists in `src/vm/config.rs:226`. QCOW2 natively supports backing files — reads that miss the child's data fall through to the parent's image. This is the same mechanism QEMU/libvirt use for VM snapshots.
+
+Creating a QCOW2 with a backing file:
+
+```bash
+qemu-img create -f qcow2 -b /path/to/parent/overlay.raw -F raw child/overlay.qcow2
+# Or for chained children:
+qemu-img create -f qcow2 -b /path/to/parent/overlay.qcow2 -F qcow2 child/overlay.qcow2
 ```
 
-crun executes `mount("overlay", "/workspace", "overlay", 0, "lowerdir=...,upperdir=...,workdir=...")` as root before starting the container process. This is a standard kernel overlayfs mount — no special crun features required.
+The child disk starts at near-zero size and grows only as data is written. Reads transparently fall through the backing chain.
+
+##### Host Mount COW via Agent-Level Overlay
+
+For host-mounted directories (virtiofs), QCOW2 doesn't apply (they're not block devices). Instead, the **agent applies overlayfs at boot** for child VMs:
+
+1. Host shares `/Users/me/project` via virtiofs (unchanged)
+2. Agent mounts virtiofs at `/mnt/virtiofs/smolvm0` (unchanged)
+3. **For child VMs:** Instead of bind-mounting, agent creates an overlayfs:
+   - `lowerdir=/mnt/virtiofs/smolvm0` (host dir, read-only)
+   - `upperdir=/mnt/storage/cow-mounts/smolvm0/upper` (on storage disk)
+   - `workdir=/mnt/storage/cow-mounts/smolvm0/work` (on storage disk)
+4. Bind-mounts the merged view at the original target path
+5. Container/process sees full host dir contents, writes go to storage disk
+
+This is done at the **VM level** (during agent `init_volume_mounts()`), not at the container level, so every process in the VM — containers, direct exec, init scripts — all see the same COW view.
+
+The agent knows it's a child VM via an environment variable set by the host launcher:
+
+```
+SMOLVM_COW_MOUNTS=1
+```
 
 ### Implementation Plan
 
-#### Layer 1: Protocol (`smolvm-protocol`)
+#### Phase 1: QCOW2 Child Disk Creation (Host Side)
 
-Add a `MountMode` enum to the protocol:
+**`src/storage.rs`** — Add QCOW2 creation with backing file:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MountMode {
-    /// Direct bind mount — writes propagate to host (default).
-    #[default]
-    Bind,
-    /// Read-only bind mount — writes are rejected.
-    ReadOnly,
-    /// Copy-on-write overlay — reads from host, writes stay in container.
-    Cow,
+/// Create a QCOW2 disk image with a backing file for COW cloning.
+pub fn create_qcow2_with_backing(
+    child_path: &Path,
+    backing_path: &Path,
+    backing_format: DiskFormat,  // Raw or Qcow2
+) -> Result<()> {
+    let backing_fmt = match backing_format {
+        DiskFormat::Raw => "raw",
+        DiskFormat::Qcow2 => "qcow2",
+    };
+
+    let output = std::process::Command::new("qemu-img")
+        .args([
+            "create",
+            "-f", "qcow2",
+            "-b", &backing_path.to_string_lossy(),
+            "-F", backing_fmt,
+            &child_path.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| Error::storage("create qcow2", e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::storage("create qcow2 with backing", stderr.to_string()));
+    }
+
+    Ok(())
 }
 ```
 
-Update the mount tuple format in `AgentRequest::Run`, `AgentRequest::CreateContainer`, and `AgentRequest::Exec` from `Vec<(String, String, bool)>` to a struct:
+**Dependency:** `qemu-img` must be available on the host. On macOS: `brew install qemu`. On Linux: `apt install qemu-utils`. This is a build/dev dependency only — the created QCOW2 files are consumed by libkrun which has native QCOW2 support.
+
+#### Phase 2: VM Record Lineage (Config)
+
+**`src/config.rs`** — Extend `VmRecord` with parent tracking:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MountEntry {
-    /// Virtiofs tag (e.g., "smolvm0").
-    pub tag: String,
-    /// Mount path inside the container.
-    pub container_path: String,
-    /// Mount mode.
-    pub mode: MountMode,
+pub struct VmRecord {
+    // ... existing fields ...
+
+    /// Parent VM name (if this is a COW clone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+
+    /// Disk format for this VM's disks.
+    #[serde(default)]
+    pub disk_format: DiskFormat,  // Raw for base VMs, Qcow2 for clones
+
+    /// Whether host mounts should be overlaid (COW) instead of direct bind.
+    #[serde(default)]
+    pub cow_mounts: bool,
 }
 ```
 
-**Backward compatibility:** The agent should accept both the old tuple format and the new struct format during a transition period. The old `(tag, path, read_only)` tuple maps to `MountEntry { tag, container_path, mode: if read_only { ReadOnly } else { Bind } }`.
+#### Phase 3: Copy Command (CLI + Logic)
 
-#### Layer 2: Host-side types (`smolvm` crate)
-
-**`src/vm/config.rs`** — Add `MountMode` to `HostMount`:
+**`src/cli/microvm.rs`** — Add `Copy` subcommand:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum MountMode {
-    #[default]
-    Rw,
-    Ro,
-    Cow,
-}
+/// Copy a microVM to create a new COW clone.
+///
+/// The child VM shares the parent's disk state via QCOW2 backing files.
+/// Only new writes consume disk space. Host mounts are overlaid so
+/// writes stay in the child VM.
+///
+/// Examples:
+///   smolvm microvm copy base-dev feature-a
+///   smolvm microvm copy base-dev experiment --cpus 4 --mem 4096
+#[derive(Args, Debug)]
+pub struct CopyCmd {
+    /// Source microVM to copy from
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
 
-pub struct HostMount {
-    pub source: PathBuf,
-    pub target: PathBuf,
-    pub read_only: bool,   // kept for backward compat
-    pub mode: MountMode,   // new field, takes precedence
+    /// Name for the new microVM
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Override CPU count (default: inherit from parent)
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
+
+    /// Override memory in MiB (default: inherit from parent)
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
 }
 ```
 
-**`src/mount.rs`** — Update `MountBinding`, `parse_mount_spec()`, `validate_mount()`:
+**`src/cli/vm_common.rs`** — Add `copy_vm()`:
 
 ```rust
-// Parse: host:guest[:ro|:rw|:cow]
-[source, target, "cow"] => Ok(HostMount::new_cow(source, target)),
+pub fn copy_vm(kind: VmKind, source: &str, name: &str, overrides: CopyOverrides) -> Result<()> {
+    let mut config = SmolvmConfig::load()?;
+
+    // 1. Validate source exists and is stopped
+    let parent = config.get_vm(source)
+        .ok_or_else(|| Error::vm_not_found(source))?;
+    if parent.actual_state() == RecordState::Running {
+        return Err(Error::invalid_state("parent VM must be stopped before copying"));
+    }
+
+    // 2. Validate target doesn't exist
+    if config.get_vm(name).is_some() {
+        return Err(Error::vm_creation(format!("VM '{}' already exists", name)));
+    }
+
+    // 3. Determine parent disk format and paths
+    let parent_dir = vm_data_dir(source);
+    let child_dir = vm_data_dir(name);
+    std::fs::create_dir_all(&child_dir)?;
+
+    let parent_overlay = parent_dir.join(if parent.disk_format == DiskFormat::Qcow2 {
+        "overlay.qcow2"
+    } else {
+        OVERLAY_DISK_FILENAME  // "overlay.raw"
+    });
+    let parent_storage = parent_dir.join(if parent.disk_format == DiskFormat::Qcow2 {
+        "storage.qcow2"
+    } else {
+        STORAGE_DISK_FILENAME  // "storage.raw"
+    });
+
+    // 4. Create QCOW2 children with backing files
+    create_qcow2_with_backing(
+        &child_dir.join("overlay.qcow2"),
+        &parent_overlay,
+        parent.disk_format,
+    )?;
+    create_qcow2_with_backing(
+        &child_dir.join("storage.qcow2"),
+        &parent_storage,
+        parent.disk_format,
+    )?;
+
+    // 5. Create child VmRecord
+    let child_record = VmRecord {
+        name: name.to_string(),
+        parent: Some(source.to_string()),
+        disk_format: DiskFormat::Qcow2,
+        cow_mounts: true,
+        // Inherit from parent, with optional overrides
+        cpus: overrides.cpus.unwrap_or(parent.cpus),
+        mem: overrides.mem.unwrap_or(parent.mem),
+        mounts: parent.mounts.clone(),
+        ports: parent.ports.clone(),
+        network: parent.network,
+        ..VmRecord::default_from_name(name)
+    };
+
+    config.insert_vm(name.to_string(), child_record)?;
+
+    println!("Created '{}' (clone of '{}')", name, source);
+    println!("  overlay: {}/overlay.qcow2", child_dir.display());
+    println!("  storage: {}/storage.qcow2", child_dir.display());
+    Ok(())
+}
 ```
 
-**`src/api/types.rs`** — Add optional `mode` field to `MountSpec` and `ContainerMountSpec`.
+#### Phase 4: Launch Child VMs with QCOW2 Disks
 
-#### Layer 3: Guest agent (`smolvm-agent`)
+**`src/agent/launcher.rs`** — When launching a child VM, use QCOW2 format:
 
-**`crates/smolvm-agent/src/oci.rs`** — Add `add_overlay_mount()`:
+The existing `launch_agent_vm()` already attaches overlay and storage disks as virtio-blk devices. The change is:
 
 ```rust
-impl OciSpec {
-    pub fn add_overlay_mount(
-        &mut self,
-        lower_source: &str,
-        destination: &str,
-        upper_dir: &str,
-        work_dir: &str,
-    ) {
-        self.mounts.push(OciMount {
-            destination: destination.to_string(),
-            mount_type: Some("overlay".to_string()),
-            source: "overlay".to_string(),
-            options: vec![
-                format!("lowerdir={}", lower_source),
-                format!("upperdir={}", upper_dir),
-                format!("workdir={}", work_dir),
-            ],
-        });
+// Before (always raw):
+let overlay_disk = DiskConfig::new("overlay", overlay_path).format(DiskFormat::Raw);
+
+// After (format-aware):
+let overlay_disk = DiskConfig::new("overlay", overlay_path).format(record.disk_format);
+let storage_disk = DiskConfig::new("storage", storage_path).format(record.disk_format);
+```
+
+libkrun handles QCOW2 natively via `krun_add_disk2(ctx, id, path, 1 /* Qcow2 */, false)`.
+
+#### Phase 5: Agent-Level Mount COW
+
+**`crates/smolvm-agent/src/main.rs`** — Update `init_volume_mounts()` path:
+
+When `SMOLVM_COW_MOUNTS=1` is set (passed via env by host launcher for child VMs):
+
+```rust
+fn init_volume_mounts_cow(mounts: Vec<(String, String, bool)>) {
+    for (tag, guest_path, _read_only) in &mounts {
+        // 1. Mount virtiofs at staging (same as today)
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        mount_virtiofs(&tag, &virtiofs_mount);
+
+        // 2. Create overlay dirs on storage disk
+        let cow_dir = Path::new("/mnt/storage/cow-mounts").join(tag);
+        let upper = cow_dir.join("upper");
+        let work = cow_dir.join("work");
+        let merged = cow_dir.join("merged");
+        std::fs::create_dir_all(&upper).ok();
+        std::fs::create_dir_all(&work).ok();
+        std::fs::create_dir_all(&merged).ok();
+
+        // 3. Mount overlayfs
+        let opts = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            virtiofs_mount.display(), upper.display(), work.display()
+        );
+        // mount -t overlay overlay -o $opts $merged
+        mount_overlay(&opts, &merged);
+
+        // 4. Bind-mount merged view at the guest target path
+        bind_mount(&merged, Path::new(guest_path));
     }
 }
 ```
 
-**`crates/smolvm-agent/src/storage.rs`** — Update `setup_volume_mounts()` and `run_command()`:
+This happens at boot, before the vsock listener starts, so all subsequent operations (container runs, exec, etc.) see the COW view of host directories.
+
+#### Phase 6: Parent Protection
+
+When a parent VM has children, its disks are part of a QCOW2 backing chain and **must not be modified**. Protections:
+
+**`src/cli/vm_common.rs`** — Prevent starting a parent that has children:
 
 ```rust
-fn setup_volume_mounts(
-    rootfs: &str,
-    mounts: &[MountEntry],
-    container_id: &str,  // needed for per-container upper dirs
-) -> Result<Vec<PathBuf>> {
-    for mount in mounts {
-        // Step 1: Mount virtiofs at staging (unchanged)
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(&mount.tag);
-        mount_virtiofs_if_needed(&mount.tag, &virtiofs_mount)?;
+pub fn start_vm_named(kind: VmKind, name: &str) -> Result<()> {
+    let config = SmolvmConfig::load()?;
 
-        match mount.mode {
-            MountMode::Bind | MountMode::ReadOnly => {
-                // Existing behavior: bind mount into container rootfs
-                bind_mount_into_rootfs(&virtiofs_mount, rootfs, &mount.container_path, mount.mode == MountMode::ReadOnly)?;
-            }
-            MountMode::Cow => {
-                // New: create overlay dirs, bind mount will be handled by crun
-                // via OCI spec overlay mount entry
-                let cow_root = Path::new(paths::COW_MOUNT_ROOT)
-                    .join(container_id)
-                    .join(&mount.tag);
-                std::fs::create_dir_all(cow_root.join("upper"))?;
-                std::fs::create_dir_all(cow_root.join("work"))?;
-            }
-        }
+    // Check if this VM is a parent of any other VM
+    let has_children = config.list_vms()
+        .any(|(_, record)| record.parent.as_deref() == Some(name));
+
+    if has_children {
+        return Err(Error::invalid_state(
+            format!("VM '{}' has child clones — starting it would corrupt their backing chain. \
+                     Delete children first, or create a new copy to work from.", name)
+        ));
     }
+
+    // ... existing start logic
 }
 ```
 
-For COW mounts, instead of calling `spec.add_bind_mount()`, the agent calls `spec.add_overlay_mount()`:
+**`src/cli/vm_common.rs`** — Prevent deleting a parent with children:
 
 ```rust
-for mount in mounts {
-    let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(&mount.tag);
-    match mount.mode {
-        MountMode::Bind => spec.add_bind_mount(&virtiofs_mount, &mount.container_path, false),
-        MountMode::ReadOnly => spec.add_bind_mount(&virtiofs_mount, &mount.container_path, true),
-        MountMode::Cow => {
-            let cow_root = Path::new(paths::COW_MOUNT_ROOT)
-                .join(container_id)
-                .join(&mount.tag);
-            spec.add_overlay_mount(
-                &virtiofs_mount.to_string_lossy(),
-                &mount.container_path,
-                &cow_root.join("upper").to_string_lossy(),
-                &cow_root.join("work").to_string_lossy(),
-            );
-        }
+pub fn delete_vm(kind: VmKind, name: &str, force: bool, opts: DeleteVmOptions) -> Result<()> {
+    let config = SmolvmConfig::load()?;
+
+    let children: Vec<_> = config.list_vms()
+        .filter(|(_, r)| r.parent.as_deref() == Some(name))
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    if !children.is_empty() {
+        return Err(Error::invalid_state(
+            format!("VM '{}' is parent of: {}. Delete children first.",
+                name, children.join(", "))
+        ));
     }
+
+    // ... existing delete logic
 }
 ```
 
-**`crates/smolvm-agent/src/paths.rs`** — Add constant:
+### Diff and Sync Commands (Future Phase)
 
-```rust
-/// Root directory for COW overlay upper/work dirs.
-pub const COW_MOUNT_ROOT: &str = "/mnt/cow";
+#### `smolvm microvm diff`
+
+Shows what the child VM changed relative to its parent. For QCOW2 disks, this can be done by mounting the child's overlay disk and listing the upper layer. For host mount COW, list files in the `cow-mounts/<tag>/upper/` directory.
+
+```bash
+$ smolvm microvm diff feature-a
+Modified files (overlay disk):
+  /usr/lib/node_modules/typescript/...  (apk add)
+  /etc/apk/world                        (package list)
+
+Modified files (mount /workspace):
+  /workspace/src/index.ts               (modified)
+  /workspace/package-lock.json          (modified)
+  /workspace/node_modules/              (new directory)
 ```
 
-#### Layer 4: CLI (`src/cli/`)
+#### `smolvm microvm sync`
 
-**`src/cli/parsers.rs`** — Extend `parse_mount_spec()` to accept `:cow`.
+Explicitly copies changes from the child's COW mount back to the host:
 
-**`src/cli/sandbox.rs`**, **`src/cli/container.rs`** — No changes needed; they pass through the parsed mount structs.
-
-#### Layer 5: Cleanup
-
-When a container is deleted, the agent removes its COW upper/work directories:
-
-```rust
-fn cleanup_cow_mounts(container_id: &str) {
-    let cow_dir = Path::new(paths::COW_MOUNT_ROOT).join(container_id);
-    if cow_dir.exists() {
-        let _ = std::fs::remove_dir_all(&cow_dir);
-    }
-}
+```bash
+$ smolvm microvm sync feature-a --mount /workspace
+Syncing /workspace changes to /Users/me/project...
+  Modified: src/index.ts
+  Modified: package-lock.json
+  New: node_modules/ (skipped, in .gitignore)
+Synced 2 files.
 ```
 
-This is called from the existing container deletion path in `container.rs`.
-
-### Storage Location for Upper Layers
-
-The `upperdir` and `workdir` must reside on a filesystem that supports overlayfs (ext4, xfs — not tmpfs on older kernels). Two options:
-
-| Location | Pros | Cons |
-|----------|------|------|
-| **Storage disk (`/dev/vda`)** | Persistent, survives container restart, large capacity | Shared I/O with image layers |
-| **Overlay disk (`/dev/vdb`)** | Separate I/O path, already used for rootfs overlay | Limited size (default 2 GiB) |
-
-**Recommendation:** Use the **storage disk** (`/mnt/storage/cow/`). It has more capacity (default 20 GiB), is already formatted ext4, and persistence across container restarts is a useful property. The COW upper dirs are small relative to the storage disk since they only contain deltas.
-
-The path hierarchy:
-
-```
-/mnt/storage/cow/
-└── <container_id>/
-    ├── smolvm0/
-    │   ├── upper/    ← writes for first mounted volume
-    │   └── work/     ← overlayfs internal
-    └── smolvm1/
-        ├── upper/    ← writes for second mounted volume
-        └── work/
-```
+This uses the `upperdir` contents — only files that were actually written by the child.
 
 ### Constraints and Limitations
 
-1. **Kernel requirement:** The guest kernel (embedded via libkrunfw) must support overlayfs. This is standard in Linux 4.x+ and is already used by smolVM for image layer overlays — no new requirement.
+1. **Parent must be stopped during copy.** QCOW2 backing files must be consistent. If the parent's ext4 filesystem has uncommitted journal entries, the child would see a corrupt filesystem. Stopping the parent ensures a clean state. (Future: support live snapshots by flushing the filesystem first.)
 
-2. **File ownership:** overlayfs preserves uid/gid from the lower layer. Files created in the upper layer get the uid/gid of the container process. This matches standard container behavior.
+2. **Parent is frozen after copy.** Starting a parent would modify its disks, invalidating children's backing references. The parent effectively becomes a read-only "image" once it has children. This is the standard QCOW2 backing chain contract.
 
-3. **Hard links across layers:** overlayfs does not support hard links between files that exist in different layers (lower vs upper). This is a known overlayfs limitation and is unlikely to matter in practice.
+3. **Chain depth.** Deep QCOW2 chains (A → B → C → D → ...) add read latency as each miss traverses the chain. Recommended limit: 5-10 levels. A future `smolvm microvm flatten` command could collapse the chain by merging layers.
 
-4. **inotify:** inotify events on the lower layer (host changes) are not visible through the overlay. The container sees a snapshot of the host directory at mount time. Host-side changes to existing files will be visible on read (overlayfs checks lower layer on cache miss), but new files added on the host after mount may not appear until the overlay dentry cache expires.
+4. **`qemu-img` dependency.** Required on the host for creating QCOW2 images. libkrun reads QCOW2 natively, but doesn't create them. This is a standard tool available via `brew install qemu` / `apt install qemu-utils`.
 
-5. **xattr support:** Depends on the upper layer filesystem. ext4 supports xattrs, so this should work.
+5. **Disk space accounting.** Child QCOW2 disks are thin — they only consume space for written blocks. But the parent's raw disks still consume their full sparse-allocated size. `smolvm microvm ls` should show both the child's actual usage and the backing chain's total.
 
-6. **Nested overlayfs:** The container rootfs is already an overlayfs (image layers). Mounting another overlayfs inside it works on Linux 5.11+ (nested overlay support). The libkrunfw kernel version should be verified. If nested overlay is not supported, the agent can fall back to bind-mounting the merged view from a pre-mounted overlayfs (done at agent level instead of crun level).
+6. **Host mount COW is at the VM level.** All processes inside the child VM see the same overlaid view of host mounts. This is intentional — the VM is the isolation boundary, not individual containers within it.
 
-### Wire Protocol Compatibility
+7. **inotify on COW mounts.** Host-side file changes to the virtiofs lower layer are visible on read (overlayfs defers to lower layer on cache miss), but inotify events from the host do not propagate through the overlay.
 
-The protocol change (tuple → `MountEntry` struct) is backward-incompatible at the message level. To handle mixed-version host/agent:
+### Alternatives Considered
 
-- **New host + old agent:** The host sends the new `MountEntry` format. The old agent will fail to deserialize `MountMode::Cow` entries. Since the agent runs inside the VM and is bundled with the rootfs, host and agent versions are always in sync. **No compatibility issue in practice.**
+#### 1. Container-level COW mounts via OCI spec
 
-- **Serialization:** `MountEntry` with `mode: "bind"` / `mode: "readonly"` is a clean superset of the old boolean. The old tuple format `(tag, path, read_only)` can be dropped immediately since the agent binary is always deployed alongside the host binary.
+Add `"type": "overlay"` to the OCI config.json so crun mounts an overlay per container.
+
+**Rejected because:**
+- COW at the container level doesn't capture VM-level state (installed packages, system configs)
+- Doesn't support the "copy a whole environment" use case
+- Multiple containers in the same VM would have different views of the same mount
+- Doesn't compose with `smolvm microvm exec` (which runs outside containers)
+
+#### 2. Raw disk copy + overlayfs (no QCOW2)
+
+Copy parent disks as full raw images and use overlayfs inside the guest.
+
+**Rejected because:**
+- O(n) copy time and disk usage (a 20 GB storage disk requires a 20 GB copy)
+- QCOW2 backing chains provide O(1) creation and minimal space usage
+- libkrun already supports QCOW2 natively
+
+#### 3. Btrfs/ZFS snapshots
+
+Use filesystem-level snapshots for the disk images.
+
+**Rejected because:**
+- Requires specific host filesystem (Btrfs/ZFS) — not available on APFS (macOS) or standard ext4 (Linux)
+- QCOW2 is filesystem-agnostic and works everywhere
+
+#### 4. LVM thin provisioning
+
+Use LVM thin volumes for COW disk cloning.
+
+**Rejected because:**
+- Requires root/LVM setup on the host
+- Overkill for development use cases
+- Not available on macOS
 
 ### Testing Strategy
 
 #### Unit Tests
 
-- `oci.rs`: Test `add_overlay_mount()` generates correct OCI spec JSON
-- `parsers.rs`: Test `parse_mount_spec()` accepts `:cow` and rejects invalid modes
-- `mount.rs`: Test `MountBinding` with `MountMode::Cow`
-- `protocol`: Test `MountEntry` serialization/deserialization
+- `storage.rs`: Test `create_qcow2_with_backing()` creates valid QCOW2 files
+- `config.rs`: Test `VmRecord` with parent/disk_format serialization roundtrip
+- `config.rs`: Test parent protection (has_children check)
 
-#### Integration Tests
-
-Add to `tests/test_sandbox.sh`:
+#### Integration Tests (`tests/test_microvm.sh`)
 
 ```bash
-# Test COW mount: write in container, verify host unchanged
-echo "original" > /tmp/test-cow/file.txt
-smolvm sandbox run -v /tmp/test-cow:/workspace:cow alpine -- \
-    sh -c 'echo "modified" > /workspace/file.txt && cat /workspace/file.txt'
-# Output should show "modified" (container sees its write)
+# Test basic copy
+smolvm microvm create parent --cpus 1 --mem 512
+smolvm microvm start parent
+smolvm microvm exec parent -- sh -c 'echo "hello" > /tmp/parent-file'
+smolvm microvm stop parent
 
-# Verify host file is unchanged
-[ "$(cat /tmp/test-cow/file.txt)" = "original" ] || echo "FAIL: host was modified"
+smolvm microvm copy parent child
+smolvm microvm start child
+smolvm microvm exec child -- cat /tmp/parent-file  # Should print "hello"
+smolvm microvm exec child -- sh -c 'echo "modified" > /tmp/parent-file'
+smolvm microvm stop child
 
-# Test COW mount: new files in container don't appear on host
-smolvm sandbox run -v /tmp/test-cow:/workspace:cow alpine -- \
-    touch /workspace/new-file.txt
-[ ! -f /tmp/test-cow/new-file.txt ] || echo "FAIL: new file leaked to host"
+# Parent's file should be unchanged (QCOW2 COW)
+smolvm microvm start parent  # ERROR: has children
+smolvm microvm delete child
+smolvm microvm start parent
+smolvm microvm exec parent -- cat /tmp/parent-file  # Should print "hello"
+smolvm microvm stop parent
 
-# Test COW mount: deleting files in container doesn't affect host
-smolvm sandbox run -v /tmp/test-cow:/workspace:cow alpine -- \
-    rm /workspace/file.txt
-[ -f /tmp/test-cow/file.txt ] || echo "FAIL: host file was deleted"
+# Test host mount COW
+mkdir -p /tmp/test-cow && echo "original" > /tmp/test-cow/file.txt
+smolvm microvm create base -v /tmp/test-cow:/workspace
+smolvm microvm start base && smolvm microvm stop base
+smolvm microvm copy base child-cow
+smolvm microvm start child-cow
+smolvm microvm exec child-cow -- sh -c 'echo "changed" > /workspace/file.txt'
+smolvm microvm stop child-cow
+# Host file must be unchanged
+[ "$(cat /tmp/test-cow/file.txt)" = "original" ] || echo "FAIL"
 ```
-
-#### Edge Case Tests
-
-- COW mount with empty host directory
-- COW mount with deeply nested directory structures
-- COW mount with symlinks in the host directory
-- COW mount with special files (sockets, FIFOs) — should be excluded
-- Multiple containers with COW mounts to the same host directory (isolation test)
-- Container restart with COW mount (upper layer persists if same container ID)
-- Disk space exhaustion on the storage disk during COW writes
-
-### Migration and Rollout
-
-1. **Phase 1:** Implement `MountMode::Cow` end-to-end, gated behind the `:cow` CLI flag. Existing `:ro` and `:rw` behavior is unchanged. No default behavior changes.
-
-2. **Phase 2:** Add `mode` field to HTTP API `MountSpec`. Old API clients that omit `mode` get the existing `readonly`-based behavior.
-
-3. **Phase 3 (future, optional):** Consider making `cow` the default for sandbox mounts where the user hasn't specified a mode. This would be a breaking change and needs separate discussion.
-
-### Alternatives Considered
-
-#### 1. Agent-level overlayfs (before crun)
-
-Mount the overlayfs at the agent level in `setup_volume_mounts()` and bind-mount the merged dir into the container.
-
-**Rejected because:**
-- All containers share the same upper layer (no per-container isolation)
-- Cleanup requires the agent to track which overlays belong to which container
-- Adds complexity to the agent mount code path
-
-#### 2. tmpfs upper layer
-
-Use a tmpfs-backed upper layer instead of the storage disk.
-
-**Rejected because:**
-- Consumes VM RAM for file writes
-- Lost on any container restart
-- tmpfs doesn't support overlayfs upperdir on older kernels
-
-#### 3. FUSE-based COW (e.g., unionfs-fuse)
-
-Run a userspace filesystem to intercept writes.
-
-**Rejected because:**
-- Adds a runtime dependency (FUSE binary)
-- Significantly slower than kernel overlayfs
-- More complex failure modes
-
-#### 4. Client-side snapshot + rsync
-
-Copy the host directory into the VM and mount the copy.
-
-**Rejected because:**
-- O(n) in directory size at startup (could be gigabytes)
-- Wastes disk space (full copy, not just deltas)
-- Not practical for large codebases
 
 ## Unresolved Questions
 
-1. **Should COW upper layers persist across container restarts?** Current design says yes (stored on persistent storage disk). This means stopping and restarting a container preserves its writes. If ephemeral behavior is preferred, upper layers could be stored on tmpfs or cleaned on container stop.
+1. **Live copy (without stopping parent).** Could flush the guest filesystem via `sync` + `fsfreeze` over vsock before snapshotting. This is more complex but would enable forking running VMs. Defer to a follow-up RFC.
 
-2. **Should there be a way to "commit" COW changes back to the host?** A future `smolvm sandbox commit-mounts` command could rsync the upper layer back to the host. This is out of scope for this RFC but worth noting as a possible follow-up.
+2. **`smolvm microvm flatten` to collapse QCOW2 chains.** When a chain gets deep, `qemu-img commit` or `qemu-img rebase` can merge layers. Should this be manual or automatic?
 
-3. **Nested overlayfs kernel version.** The libkrunfw embedded kernel version needs to be checked for nested overlay support (Linux 5.11+). If not supported, the fallback is agent-level overlay mounting with per-container dirs (slightly less clean but functionally equivalent).
+3. **Should `smolvm microvm copy` work on running VMs with a warning?** Some users may prefer convenience over perfect consistency. A `--force` flag could skip the stopped-state check with a warning about potential filesystem inconsistency.
 
-4. **Quota / size limits for COW upper layers.** Should there be a configurable limit on how much data a container can write to its COW upper layer? This could prevent a single container from filling the storage disk. Could be implemented as a separate ext4 loopback image per container, but adds complexity.
+4. **Quota limits per child.** Should child QCOW2 disks have a configurable maximum size to prevent unbounded growth? QCOW2 supports preallocation limits but not hard caps natively. Could be enforced by monitoring file size.
+
+5. **How to handle `smolvm microvm sync` for non-mount changes.** Syncing host mount COW back is straightforward (copy upperdir). But should we also support extracting rootfs changes (installed packages) from the overlay disk? This would enable "exporting" a configured environment.
