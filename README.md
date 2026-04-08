@@ -144,6 +144,128 @@ Platform Support
 | Linux x86_64 | x86_64 Linux | KVM (`/dev/kvm`) |
 | Linux aarch64 | aarch64 Linux | KVM (`/dev/kvm`) |
 
+Multi-VM Features
+-----------------
+
+**Fork a machine** — create a new VM from an existing one with copy-on-write disk semantics. The forked machine inherits all installed packages and files without duplicating the full disk.
+
+```bash
+smolvm machine create base --net --cpus 2 --mem 4096
+smolvm machine start -n base
+smolvm machine exec -n base -- apk add python3 nodejs
+smolvm machine stop -n base
+
+# Fork into independent workers (CoW — near-instant on btrfs/APFS)
+smolvm machine fork --source base --name worker-1
+smolvm machine fork --source base --name worker-2
+smolvm machine start -n worker-1
+smolvm machine start -n worker-2
+```
+
+**Inter-VM networking** — group machines together so they can communicate via host port forwarding.
+
+```bash
+smolvm machine create server --group myapp --net -p 19000:9000
+smolvm machine create client --group myapp --net
+smolvm machine start -n server
+smolvm machine start -n client
+
+# List peers and their port mappings
+smolvm machine peers --group myapp
+
+# Auto-allocate a host port to bridge two VMs
+smolvm machine connect client server --port 9000
+```
+
+**Copy files between VMs** — transfer files between two running machines.
+
+```bash
+smolvm machine cp vm-a:/data/output.json vm-b:/data/input.json
+```
+
+Build from Source
+-----------------
+
+### Prerequisites
+
+| Dependency | Linux | macOS |
+|-----------|-------|-------|
+| Rust | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | same |
+| git-lfs | `sudo apt install git-lfs` | `brew install git-lfs` |
+| e2fsprogs | `sudo apt install e2fsprogs` | `brew install e2fsprogs` |
+| Docker | `sudo apt install docker.io` | Docker Desktop |
+| KVM | `/dev/kvm` must be accessible | N/A (uses Hypervisor.framework) |
+| musl target | `rustup target add x86_64-unknown-linux-musl` | `rustup target add aarch64-unknown-linux-musl` |
+
+### Step 1: Clone and pull LFS objects
+
+```bash
+git clone https://github.com/ataul443/smolvm.git
+cd smolvm
+git lfs install && git lfs pull
+```
+
+### Step 2: Build the agent rootfs
+
+The agent rootfs is an Alpine Linux filesystem that runs inside each VM. It requires Docker and `sudo` for package installation.
+
+```bash
+# First, build the static musl agent binary (as your user, not sudo)
+rustup target add x86_64-unknown-linux-musl  # or aarch64- on ARM
+cargo build --profile release-small --target x86_64-unknown-linux-musl -p smolvm-agent
+
+# Then build the rootfs (needs sudo for apk package install)
+sudo AGENT_BINARY=$PWD/target/x86_64-unknown-linux-musl/release-small/smolvm-agent \
+  ./scripts/build-agent-rootfs.sh --no-build-agent
+```
+
+### Step 3: Build smolvm
+
+```bash
+# Linux — use the linux-x86_64 libs
+LIBRARY_PATH=$PWD/lib/linux-x86_64 cargo build --release
+
+# macOS — use the root lib/ directory
+# export PATH="/opt/homebrew/opt/e2fsprogs/bin:/opt/homebrew/opt/llvm/bin:$PATH"
+# LIBRARY_PATH=$PWD/lib cargo build --release
+```
+
+### Step 4: Install the rootfs and binary
+
+```bash
+# Copy rootfs to smolvm's data directory
+mkdir -p ~/.local/share/smolvm
+cp -r target/agent-rootfs ~/.local/share/smolvm/agent-rootfs
+
+# Add smolvm to your PATH
+export PATH="$PWD/target/release:$PATH"
+export LD_LIBRARY_PATH="$PWD/lib/linux-x86_64:$LD_LIBRARY_PATH"  # Linux
+# export DYLD_LIBRARY_PATH="$PWD/lib:$DYLD_LIBRARY_PATH"  # macOS
+```
+
+### Step 5: Verify
+
+```bash
+smolvm machine create test1 --cpus 2 --mem 2048
+smolvm machine start -n test1
+smolvm machine exec -n test1 -- echo "Hello from smolvm!"
+smolvm machine stop -n test1
+smolvm machine delete -n test1
+```
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `unable to find library -lkrun` | Use `LIBRARY_PATH=$PWD/lib/linux-x86_64` (Linux) or `$PWD/lib` (macOS) |
+| `Database already open` | `pkill -f "smolvm serve"; pkill -f "smolvm-bin"` |
+| `/dev/kvm` not accessible | `sudo chmod 666 /dev/kvm` or add user to `kvm` group |
+| `agent-rootfs` not found | Run the rootfs build (Step 2) and copy to `~/.local/share/smolvm/` |
+| `apk.static: Use --usermode` | The rootfs build needs `sudo` — don't run it as a regular user |
+| `curl: (23) Failure writing` | Clean stale files: `sudo rm -rf /tmp/apk-static* target/agent-rootfs` and retry |
+| `Cannot build smolvm-agent` | Build the agent separately first, then pass `AGENT_BINARY=... --no-build-agent` |
+| Fork fails "is running" | Stop the source VM first: `smolvm machine stop -n <name>` |
+
 Known Limitations
 -----------------
 
@@ -152,6 +274,8 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU support is currently being worked on [in a separate branch](https://github.com/smol-machines/smolvm/tree/binbin-gpu-support).
+* VM fork requires the source machine to be stopped (for disk consistency).
+* Inter-VM networking uses host port forwarding via TSI — not direct veth/bridge.
 
 Development
 -----------
