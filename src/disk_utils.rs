@@ -257,7 +257,7 @@ pub(crate) fn write_last_byte(
 ///
 /// - macOS: `clonefile()` for instant APFS copy-on-write (falls back to `fs::copy`)
 /// - Linux: `fs::copy` (uses `copy_file_range` for sparse-aware copy)
-pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;

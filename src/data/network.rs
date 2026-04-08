@@ -38,6 +38,12 @@ pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
     }
 }
 
+/// Allocate a free host port by binding to port 0 and extracting the assigned port.
+pub fn allocate_host_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
 impl PortMapping {
     /// Create a new port mapping.
     pub fn new(host: u16, guest: u16) -> Self {

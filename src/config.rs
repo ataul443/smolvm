@@ -450,6 +450,15 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// Parent VM name (set when this VM was forked from another).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+
+    /// Network group for inter-VM communication. VMs in the same group can
+    /// discover each other's port mappings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -502,6 +511,8 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            parent: None,
+            group: None,
         }
     }
 
@@ -547,6 +558,8 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            parent: None,
+            group: None,
         }
     }
 

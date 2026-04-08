@@ -84,6 +84,7 @@ pub fn build_create_params(
                 ssh_agent: false,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
+                group: None,
             });
         }
     };
@@ -277,6 +278,7 @@ pub fn build_create_params(
             Some(sf_allow_hosts)
         },
         source_smolmachine: None,
+        group: None,
     })
 }
 

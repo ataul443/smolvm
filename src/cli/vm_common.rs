@@ -331,6 +331,8 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
+    /// Network group for inter-VM communication.
+    pub group: Option<String>,
 }
 
 /// Create a named machine configuration (does not start it).
@@ -400,6 +402,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.ssh_agent = params.ssh_agent;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
+    record.group = params.group.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -557,6 +560,50 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // image's filesystem (package managers, distro-specific paths)
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+
+    // Inject peer discovery info if this VM belongs to a network group
+    if let Some(ref group) = record.group {
+        if let Ok(all_vms) = db.list_vms() {
+            let peers: Vec<&VmRecord> = all_vms
+                .iter()
+                .filter(|(_, r)| {
+                    r.group.as_deref() == Some(group.as_str())
+                        && r.name != name
+                        && r.actual_state() == RecordState::Running
+                })
+                .map(|(_, r)| r)
+                .collect();
+
+            if !peers.is_empty() {
+                let mut discovery = serde_json::Map::new();
+                for peer in &peers {
+                    let mut peer_info = serde_json::Map::new();
+                    peer_info.insert(
+                        "host".to_string(),
+                        serde_json::Value::String("127.0.0.1".to_string()),
+                    );
+                    let port_map: serde_json::Map<String, serde_json::Value> = peer
+                        .ports
+                        .iter()
+                        .map(|(h, g)| (g.to_string(), serde_json::Value::Number((*h).into())))
+                        .collect();
+                    peer_info.insert("ports".to_string(), serde_json::Value::Object(port_map));
+                    discovery.insert(peer.name.clone(), serde_json::Value::Object(peer_info));
+                }
+
+                let discovery_json =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(discovery))
+                        .unwrap_or_default();
+
+                let _ = client.write_file(
+                    "/etc/smolvm/peers.json",
+                    discovery_json.as_bytes(),
+                    Some(0o644),
+                );
+                tracing::debug!(group = %group, "injected peer discovery for {} peers", peers.len());
+            }
+        }
+    }
 
     if record.source_smolmachine.is_some() {
         // Layers already mounted via virtiofs — no pull needed.
@@ -1445,4 +1492,222 @@ mod init_runner_tests {
         assert!(config.env.is_empty());
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
     }
+}
+
+// ============================================================================
+// Fork
+// ============================================================================
+
+/// Fork a VM by CoW-copying its disks and cloning its config record.
+///
+/// The source VM must be stopped to ensure disk consistency.
+pub fn fork_vm(source: &str, target: &str) -> smolvm::Result<()> {
+    use smolvm::storage::{OVERLAY_DISK_FILENAME, STORAGE_DISK_FILENAME};
+
+    let db = SmolvmDb::open()?;
+
+    // Validate source exists
+    let source_record = db
+        .get_vm(source)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(source))?;
+
+    // Source must be stopped for disk consistency
+    let actual_state = source_record.actual_state();
+    if actual_state == RecordState::Running {
+        return Err(smolvm::Error::config(
+            "fork",
+            format!(
+                "source machine '{}' is running. Stop it first with 'smolvm machine stop {}'",
+                source, source
+            ),
+        ));
+    }
+
+    // Validate target doesn't exist
+    if db.get_vm(target)?.is_some() {
+        return Err(smolvm::Error::config(
+            "fork",
+            format!("machine '{}' already exists", target),
+        ));
+    }
+
+    // Copy disks with CoW semantics
+    let source_dir = vm_data_dir(source);
+    let target_dir = vm_data_dir(target);
+    std::fs::create_dir_all(&target_dir)?;
+
+    println!("Forking machine '{}' -> '{}'...", source, target);
+
+    // CoW-copy storage disk (OCI layers)
+    let src_storage = source_dir.join(STORAGE_DISK_FILENAME);
+    let dst_storage = target_dir.join(STORAGE_DISK_FILENAME);
+    if src_storage.exists() {
+        smolvm::disk_utils::clone_or_copy_file(&src_storage, &dst_storage)?;
+        // Copy the .formatted marker if it exists
+        let src_marker = src_storage.with_extension("formatted");
+        if src_marker.exists() {
+            let dst_marker = dst_storage.with_extension("formatted");
+            let _ = std::fs::copy(&src_marker, &dst_marker);
+        }
+    }
+
+    // CoW-copy overlay disk (rootfs modifications)
+    let src_overlay = source_dir.join(OVERLAY_DISK_FILENAME);
+    let dst_overlay = target_dir.join(OVERLAY_DISK_FILENAME);
+    if src_overlay.exists() {
+        smolvm::disk_utils::clone_or_copy_file(&src_overlay, &dst_overlay)?;
+        let src_marker = src_overlay.with_extension("formatted");
+        if src_marker.exists() {
+            let dst_marker = dst_overlay.with_extension("formatted");
+            let _ = std::fs::copy(&src_marker, &dst_marker);
+        }
+    }
+
+    // Clone the VmRecord with updated fields
+    let mut new_record = source_record.clone();
+    new_record.name = target.to_string();
+    new_record.created_at = smolvm::util::current_timestamp();
+    new_record.state = RecordState::Created;
+    new_record.pid = None;
+    new_record.pid_start_time = None;
+    new_record.last_exit_code = None;
+    new_record.parent = Some(source.to_string());
+    new_record.ephemeral = false;
+    new_record.restart = smolvm::config::RestartConfig::default();
+
+    db.insert_vm(target, &new_record)?;
+
+    println!("Forked machine '{}' from '{}'", target, source);
+    println!(
+        "  CPUs: {}, Memory: {} MiB",
+        new_record.cpus, new_record.mem
+    );
+    if let Some(ref parent) = new_record.parent {
+        println!("  Parent: {}", parent);
+    }
+    println!(
+        "\nUse 'smolvm machine start {}' to start the forked machine",
+        target
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Peers
+// ============================================================================
+
+/// List all VMs in a network group with their port mappings.
+pub fn list_peers(group_name: &str) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+    let all_vms = db.list_vms()?;
+
+    let peers: Vec<&VmRecord> = all_vms
+        .iter()
+        .filter(|(_, r)| r.group.as_deref() == Some(group_name))
+        .map(|(_, r)| r)
+        .collect();
+
+    if peers.is_empty() {
+        println!("No machines in group '{}'", group_name);
+        return Ok(());
+    }
+
+    println!("Machines in group '{}':", group_name);
+    println!("{:<20} {:<12} PORTS", "NAME", "STATE");
+    println!("{}", "-".repeat(60));
+    for record in &peers {
+        let state = record.actual_state();
+        let ports: Vec<String> = record
+            .ports
+            .iter()
+            .map(|(h, g)| format!("{}:{}", h, g))
+            .collect();
+        let port_str = if ports.is_empty() {
+            "-".to_string()
+        } else {
+            ports.join(", ")
+        };
+        println!(
+            "{:<20} {:<12} {}",
+            record.name,
+            format!("{:?}", state),
+            port_str
+        );
+    }
+
+    // Show peer connectivity info
+    let running: Vec<&&VmRecord> = peers
+        .iter()
+        .filter(|r| r.actual_state() == RecordState::Running)
+        .collect();
+    if running.len() > 1 {
+        println!("\nConnectivity (via host port forwarding):");
+        for r in &running {
+            for (host_port, guest_port) in &r.ports {
+                println!(
+                    "  {} port {} -> 127.0.0.1:{} (from any peer)",
+                    r.name, guest_port, host_port
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Connect
+// ============================================================================
+
+/// Set up connectivity between two VMs by adding a port mapping to the target
+/// VM's configuration. The source VM can then reach the target via the host port.
+pub fn connect_vms(source: &str, target: &str, guest_port: u16) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+
+    // Validate both VMs exist
+    let _source_record = db
+        .get_vm(source)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(source))?;
+    let target_record = db
+        .get_vm(target)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(target))?;
+
+    // Check if port mapping already exists
+    for (h, g) in &target_record.ports {
+        if *g == guest_port {
+            println!(
+                "Port {} on '{}' is already mapped to host port {}",
+                guest_port, target, h
+            );
+            println!("From '{}', connect to: 127.0.0.1:{}", source, h);
+            return Ok(());
+        }
+    }
+
+    // Allocate a free host port
+    let host_port = smolvm::data::network::allocate_host_port().map_err(|e| {
+        smolvm::Error::config(
+            "allocate port",
+            format!("failed to find free host port: {}", e),
+        )
+    })?;
+
+    // Update target record with the new port mapping
+    let mut updated = target_record.clone();
+    updated.ports.push((host_port, guest_port));
+
+    db.insert_vm(target, &updated)?;
+
+    println!(
+        "Connected: {}:{} -> host:{} (reachable from '{}')",
+        target, guest_port, host_port, source
+    );
+    println!("\nFrom '{}', connect to: 127.0.0.1:{}", source, host_port);
+    println!(
+        "\nNote: Restart '{}' for the new port mapping to take effect.",
+        target
+    );
+
+    Ok(())
 }

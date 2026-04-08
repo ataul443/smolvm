@@ -116,6 +116,15 @@ pub enum MachineCmd {
     /// hash-derived, not name-derived.
     #[command(name = "data-dir")]
     DataDir(DataDirCmd),
+
+    /// Fork a machine to create a new instance with CoW disk semantics
+    Fork(ForkCmd),
+
+    /// List peer machines in the same network group
+    Peers(PeersCmd),
+
+    /// Set up network connectivity between two machines
+    Connect(ConnectCmd),
 }
 
 impl MachineCmd {
@@ -143,6 +152,9 @@ impl MachineCmd {
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
             MachineCmd::DataDir(cmd) => cmd.run(),
+            MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::Peers(cmd) => cmd.run(),
+            MachineCmd::Connect(cmd) => cmd.run(),
         }
     }
 }
@@ -279,6 +291,10 @@ pub struct RunCmd {
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
+
+    /// Network group for inter-VM communication
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
 }
 
 impl RunCmd {
@@ -973,6 +989,10 @@ pub struct CreateCmd {
     /// Uses pre-extracted layers instead of pulling from a registry.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
+
+    /// Network group for inter-VM communication
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
 }
 
 impl CreateCmd {
@@ -1040,6 +1060,9 @@ impl CreateCmd {
         }
         PortMapping::check_duplicates(&params.port)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
+        if let Some(group) = self.group {
+            params.group = Some(group);
+        }
         vm_common::create_vm(params)
     }
 
@@ -1123,6 +1146,7 @@ impl CreateCmd {
             ssh_agent: self.ssh_agent,
             dns_filter_hosts: None,
             source_smolmachine: Some(canonical_path),
+            group: None,
         };
 
         vm_common::create_vm(params)
@@ -1589,68 +1613,185 @@ pub struct CpCmd {
 
 impl CpCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Parse src/dst to determine direction
-        let (machine_name, guest_path, local_path, is_upload) =
-            if let Some((name, path)) = self.src.split_once(':') {
-                // Download: machine:path -> local
-                (name.to_string(), path.to_string(), self.dst.clone(), false)
-            } else if let Some((name, path)) = self.dst.split_once(':') {
-                // Upload: local -> machine:path
-                (name.to_string(), path.to_string(), self.src.clone(), true)
-            } else {
+        let src_parts = self.src.split_once(':');
+        let dst_parts = self.dst.split_once(':');
+
+        match (src_parts, dst_parts) {
+            // VM-to-VM transfer: src_vm:path -> dst_vm:path
+            (Some((src_name, src_path)), Some((dst_name, dst_path))) => {
+                let (mgr_src, mut client_src) =
+                    vm_common::ensure_running_and_connect(&Some(src_name.to_string()))?;
+                let (mgr_dst, mut client_dst) =
+                    vm_common::ensure_running_and_connect(&Some(dst_name.to_string()))?;
+                mgr_src.detach();
+                mgr_dst.detach();
+
+                let data = client_src.read_file(src_path)?;
+                let size = data.len();
+                client_dst.write_file(dst_path, &data, None)?;
+                eprintln!(
+                    "Transferred {}:{} ({} bytes) -> {}:{}",
+                    src_name, src_path, size, dst_name, dst_path
+                );
+            }
+            // Download: machine:path -> local
+            (Some((machine_name, guest_path)), None) => {
+                let (manager, mut client) =
+                    vm_common::ensure_running_and_connect(&Some(machine_name.to_string()))?;
+                manager.detach();
+
+                // For image-based VMs, ensure the persistent container overlay is
+                // mounted so cp targets the container filesystem (not the VM rootfs).
+                if let Some(image) = smolvm::db::SmolvmDb::open()
+                    .ok()
+                    .and_then(|db| db.get_vm(machine_name).ok().flatten())
+                    .and_then(|r| r.image.clone())
+                {
+                    let overlay_id = format!("persistent-{}", machine_name);
+                    let _ = client.prepare_overlay(&image, &overlay_id);
+                }
+
+                let mut bar = crate::cli::ProgressBar::new(
+                    format!("Downloading {} -> {}", guest_path, self.dst),
+                    None,
+                );
+                let local = std::path::Path::new(&self.dst);
+                let size = client
+                    .read_file_to_path(guest_path, local, |received| bar.update(received))?;
+                bar.finish(size);
+            }
+            // Upload: local -> machine:path
+            (None, Some((machine_name, guest_path))) => {
+                let (manager, mut client) =
+                    vm_common::ensure_running_and_connect(&Some(machine_name.to_string()))?;
+                manager.detach();
+
+                // For image-based VMs, ensure the persistent container overlay is
+                // mounted so cp targets the container filesystem (not the VM rootfs).
+                if let Some(image) = smolvm::db::SmolvmDb::open()
+                    .ok()
+                    .and_then(|db| db.get_vm(machine_name).ok().flatten())
+                    .and_then(|r| r.image.clone())
+                {
+                    let overlay_id = format!("persistent-{}", machine_name);
+                    let _ = client.prepare_overlay(&image, &overlay_id);
+                }
+
+                let file = std::fs::File::open(&self.src).map_err(|e| {
+                    smolvm::Error::agent("read local file", format!("{}: {}", self.src, e))
+                })?;
+                let size = file.metadata().map(|m| m.len()).map_err(|e| {
+                    smolvm::Error::agent("stat local file", format!("{}: {}", self.src, e))
+                })?;
+                let mut bar = crate::cli::ProgressBar::new(
+                    format!("Uploading {} -> {}", self.src, guest_path),
+                    Some(size),
+                );
+                client.write_file_from_reader_with_progress(
+                    guest_path,
+                    file,
+                    size,
+                    None,
+                    |sent| bar.update(sent),
+                )?;
+                bar.finish(size);
+            }
+            // Neither has machine:path
+            (None, None) => {
                 return Err(smolvm::Error::config(
                     "cp",
                     "one of SRC or DST must use machine:path syntax (e.g., myvm:/workspace/file)",
                 ));
-            };
-
-        let (manager, mut client) =
-            vm_common::ensure_running_and_connect(&Some(machine_name.clone()))?;
-        // Detach so the VM keeps running after cp exits.
-        manager.detach();
-
-        // For image-based VMs, ensure the persistent container overlay is
-        // mounted so cp targets the container filesystem (not the VM rootfs).
-        // prepare_overlay is idempotent: reuses if mounted, remounts if upper
-        // exists, creates fresh otherwise.
-        if let Some(image) = smolvm::db::SmolvmDb::open()
-            .ok()
-            .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-            .and_then(|r| r.image.clone())
-        {
-            let overlay_id = format!("persistent-{}", machine_name);
-            let _ = client.prepare_overlay(&image, &overlay_id);
-        }
-
-        if is_upload {
-            // Stream from file — only one chunk (~1 MiB) in memory at a time.
-            let file = std::fs::File::open(&local_path).map_err(|e| {
-                smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
-            })?;
-            let size = file.metadata().map(|m| m.len()).map_err(|e| {
-                smolvm::Error::agent("stat local file", format!("{}: {}", local_path, e))
-            })?;
-            let mut bar = crate::cli::ProgressBar::new(
-                format!("Uploading {} -> {}", local_path, guest_path),
-                Some(size),
-            );
-            client.write_file_from_reader_with_progress(&guest_path, file, size, None, |sent| {
-                bar.update(sent)
-            })?;
-            bar.finish(size);
-        } else {
-            // Stream to file — only one chunk (~16 MiB) in memory at a time.
-            let mut bar = crate::cli::ProgressBar::new(
-                format!("Downloading {} -> {}", guest_path, local_path),
-                None,
-            );
-            let local = std::path::Path::new(&local_path);
-            let size =
-                client.read_file_to_path(&guest_path, local, |received| bar.update(received))?;
-            bar.finish(size);
+            }
         }
 
         Ok(())
+    }
+}
+
+// ============================================================================
+// Fork Command
+// ============================================================================
+
+/// Fork a machine to create a new instance with copy-on-write disk semantics.
+///
+/// The source machine must be stopped. The forked machine shares the same base
+/// rootfs and gets CoW copies of the storage and overlay disks. Changes in the
+/// fork do not affect the source, and vice versa.
+///
+/// Examples:
+///   smolvm machine fork --source base --name worker-1
+///   smolvm machine fork -s base -n worker-2
+#[derive(Args, Debug)]
+pub struct ForkCmd {
+    /// Name of the source machine to fork
+    #[arg(short = 's', long)]
+    pub source: String,
+
+    /// Name for the new forked machine
+    #[arg(short = 'n', long)]
+    pub name: String,
+}
+
+impl ForkCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::fork_vm(&self.source, &self.name)
+    }
+}
+
+// ============================================================================
+// Peers Command
+// ============================================================================
+
+/// List peer machines in the same network group.
+///
+/// Shows all machines that share a network group, along with their state
+/// and port mappings for inter-VM communication.
+///
+/// Examples:
+///   smolvm machine peers --group myapp
+#[derive(Args, Debug)]
+pub struct PeersCmd {
+    /// Network group name
+    #[arg(short = 'g', long)]
+    pub group: String,
+}
+
+impl PeersCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::list_peers(&self.group)
+    }
+}
+
+// ============================================================================
+// Connect Command
+// ============================================================================
+
+/// Set up network connectivity between two machines via port forwarding.
+///
+/// Auto-allocates a host port to bridge a guest port from the target machine,
+/// making it reachable from the source machine.
+///
+/// Examples:
+///   smolvm machine connect web api --port 3000
+#[derive(Args, Debug)]
+pub struct ConnectCmd {
+    /// Source machine that will connect to the target
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+
+    /// Target machine whose port will be exposed
+    #[arg(value_name = "TARGET")]
+    pub target: String,
+
+    /// Guest port on the target machine to expose
+    #[arg(short = 'p', long)]
+    pub port: u16,
+}
+
+impl ConnectCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::connect_vms(&self.source, &self.target, self.port)
     }
 }
 
